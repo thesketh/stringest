@@ -31,6 +31,7 @@ class BuiltinParser(AbstractStep):
         kwargs: Optional[Dict[str, Any]] = None,
     ):
         self._type_name = type_name
+        # TODO: Allowlist for builtin types - some of these could be dangerous
         self._type = getattr(builtins, type_name)
 
         if args is None:

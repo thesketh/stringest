@@ -2,7 +2,6 @@
 Transformation steps built around replacing values.
 
 """
-import re
 from typing import Any, Dict, Literal, Optional, Tuple
 
 from stringest.message import Message
@@ -10,19 +9,19 @@ from stringest.steps.base import AbstractStep
 from stringest.type_aliases import Value, Success
 
 
-class DefaultValueReplacement(AbstractStep):
+class DefaultValueDerivation(AbstractStep):
     """
-    A basic transformation step, replacing values with a default value.
+    A basic transformation step, deriving a default value.
 
     Arguments:
      - `default_value`: the default value
-     - `action`: one of 'replace', 'fill'. If 'replace', ignore the current value
-       and replace it with the default. If 'fill', only replace the current value
-       if it is None.
+     - `action`: one of `{'replace', 'fill'}`. If `'replace'`, ignore the current
+       value and replace it with the default. If `'fill'`, only replace the current
+       value if it is `None` (default: `'replace'`)
 
     """
 
-    def __init__(self, *, default_value: Any, action: Literal["fill", "replace"]):
+    def __init__(self, *, default_value: Any, action: Literal["fill", "replace"] = "replace"):
         self._default_value = default_value
         if action not in {"fill", "replace"}:
             raise ValueError("`action` must be one of `{'fill', 'replace'}`")
@@ -45,49 +44,9 @@ class DefaultValueReplacement(AbstractStep):
         return value, True, None
 
 
-class RegexReplace(AbstractStep):
+class DictionaryLookupDerivation(AbstractStep):
     """
-    A basic transformation step, replacing characters in a string.
-
-    Arguments:
-     - `pattern`: the pattern to replace in the current string
-     - `replacement`: the string to replace the pattern with
-
-    """
-
-    def __init__(self, *, pattern: str, replacement: str):
-        self._pattern = pattern
-        self._compiled = re.compile(pattern)
-        self._replacement = replacement
-
-    @property
-    def parameters(self) -> Dict[str, Any]:
-        return {"pattern": self._pattern, "replacement": self._replacement}
-
-    @property
-    def type(self) -> Literal["transformation"]:
-        return "transformation"
-
-    def apply(self, value: Value) -> Tuple[Value, Success, Optional[Message]]:
-        if value is None:
-            message = Message(
-                status="ERROR", content="Cannot replace values in null string"
-            )
-            return None, False, message
-
-        if not isinstance(value, str):
-            message = Message(
-                status="ERROR",
-                content=f"Cannot replace values in non-string, got {type(value)}",
-            )
-            return None, False, message
-
-        return self._compiled.sub(self._replacement, value), True, None
-
-
-class DictionaryLookupReplacement(AbstractStep):
-    """
-    A basic transformation step, replacing values with a dictionary lookup.
+    A basic derivation step, replacing values with a dictionary lookup.
 
     Arguments:
      - `lookup_dict`: the dictionary containing replacement values.

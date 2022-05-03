@@ -34,13 +34,6 @@ class DatetimeParser(AbstractStep):
     def type(self) -> Literal["parser"]:
         return "parser"
 
-    @property
-    def description(self) -> str:
-        string = (
-            f"This parser tries to parse temporal data using `{self._format_string}`\n"
-        )
-        return super().description + string
-
     def apply(self, value: Value) -> Tuple[Value, Success, Optional[Message]]:
         if value is None:
             message = Message(

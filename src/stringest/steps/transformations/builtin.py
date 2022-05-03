@@ -18,7 +18,7 @@ class BuiltinTransform(AbstractStep):
     Arguments:
      - `type_name`: the type name to be pulled from
        [`builtins`](https://docs.python.org/3/library/functions.html)
-     - `method_name`: the name of the method from the builtin type.
+     - `method_name`: the name of the method from the builtin type
      - `args`: a list of positional arguments to be passed to the method after the value
      - `kwargs`: a list of keyword arguments to be passed to the method
 
@@ -32,6 +32,7 @@ class BuiltinTransform(AbstractStep):
         args: Optional[List[Any]] = None,
         kwargs: Optional[Dict[str, Any]] = None,
     ):
+        # TODO: Allowlist for types/methods. Otherwise, this could be dangerous.
         self._type_name = type_name
         self._type: Type = getattr(builtins, type_name)
         self._method_name = method_name

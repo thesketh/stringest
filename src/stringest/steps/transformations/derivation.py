@@ -21,7 +21,9 @@ class DefaultValueDerivation(AbstractStep):
 
     """
 
-    def __init__(self, *, default_value: Any, action: Literal["fill", "replace"] = "replace"):
+    def __init__(
+        self, *, default_value: Any, action: Literal["fill", "replace"] = "replace"
+    ):
         self._default_value = default_value
         if action not in {"fill", "replace"}:
             raise ValueError("`action` must be one of `{'fill', 'replace'}`")

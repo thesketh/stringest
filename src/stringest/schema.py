@@ -1,6 +1,6 @@
 """Representations of inbound schemas."""
 from copy import deepcopy
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, Iterable, List, Literal, Mapping, Optional, Set, Tuple, Union
 
 # import pyarrow as pa  # type: ignore
 
@@ -27,6 +27,9 @@ class Constant:  # pylint: disable=too-few-public-methods
         """The value of the constant."""
         return deepcopy(self._value)
 
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}({self._value})"
+
 
 class Special:  # pylint: disable=too-few-public-methods
     """
@@ -41,8 +44,9 @@ class Special:  # pylint: disable=too-few-public-methods
 
     """
 
-    def __init__(self, value_type: str):
-        value_type = value_type.lower()
+    def __init__(
+        self, value_type: Literal["file_name", "record_index", "record_number"]
+    ):
         if value_type not in {
             "file_name",
             "record_index",
@@ -54,9 +58,13 @@ class Special:  # pylint: disable=too-few-public-methods
             )
         self._value_type = value_type
 
-    def value_type(self) -> str:
+    @property
+    def value_type(self) -> Literal["file_name", "record_index", "record_number"]:
         """The type of special input value."""
         return self._value_type
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}({self._value_type})"
 
 
 class Field:
@@ -92,6 +100,10 @@ class Field:
         nullable: bool = True,
         fail_on_error: bool = False,
     ):
+        if not isinstance(name, (str, Constant, Special)):
+            raise TypeError(
+                f"`name` must be `str`, `Constant` or `Special`, got {type(name)}"
+            )
         self._name = name
         self._parquet_type = parquet_type
 
@@ -167,7 +179,7 @@ class Field:
 
     def ingest(  # pylint: disable=too-many-branches
         self, value: Optional[str]
-    ) -> Tuple[Value, Success, List[Message]]:
+    ) -> Tuple[Value, Success, Set[Message]]:
         """Validate and parse an inbound value."""
         if value is not None:
             # Trimming a value's whitespace, replacing with explicit None if the field
@@ -181,9 +193,15 @@ class Field:
             message = Message(
                 status="ERROR", content="Null value received in mandatory field"
             )
-            return None, False, [message]
+            return (
+                None,
+                False,
+                {
+                    message,
+                },
+            )
 
-        messages: List[Message] = []
+        messages: Set[Message] = set()
         field_success = True
 
         for step in self._steps:
@@ -207,7 +225,7 @@ class Field:
                 # or an internal error is encountered.
                 if self._fail_on_error or message.status == "INTERNAL_ERROR":
                     field_success = False
-                    messages.append(message)
+                    messages.add(message)
                     break
 
                 # If continuing with process, downgrade errors to warnings.
@@ -215,7 +233,7 @@ class Field:
                     message = message.downgrade()
 
             if message is not None:
-                messages.append(message)
+                messages.add(message)
 
         if value is None and not self._nullable:
             # This can happen if we don't raise on error and end up with a
@@ -225,7 +243,7 @@ class Field:
                     status="ERROR",
                     content="Null value in non-nullable field after ingestion",
                 )
-                messages.append(message)
+                messages.add(message)
                 field_success = False
 
         return value, field_success, messages
@@ -242,6 +260,56 @@ class Schema:
         """A copy of the fields in the schema."""
         return self._fields.copy()
 
+    def _apply(
+        self,
+        data: Iterable[Mapping[str, Optional[str]]],
+        file_name: Optional[str] = None,
+    ) -> Iterable[Tuple[Mapping[str, Any], Success, Set[Message]]]:
+        """Apply the schema to inbound data."""
+        for row_index, row in enumerate(data):
+            outbound_row = {}
+            row_success = True
+            row_messages = set()
+
+            for field in self._fields:
+                field_source = field.name
+
+                if isinstance(field_source, str):
+                    inbound_value = row.get(field_source)
+                elif isinstance(field_source, Constant):
+                    inbound_value = field_source.value
+                elif isinstance(field_source, Special):
+                    if field_source.value_type == "file_name":
+                        inbound_value = file_name
+                    elif field_source.value_type == "record_index":
+                        inbound_value = str(row_index)
+                    elif field_source.value_type == "record_number":
+                        inbound_value = str(row_index + 1)
+                else:
+                    raise TypeError(
+                        "Inbound value must be `str`, `Constant` or `Special`, got "
+                        + str(type(inbound_value))
+                    )
+
+                value, success, messages = field.ingest(inbound_value)
+                outbound_row[field.outbound_name] = value
+                if not success:
+                    row_success = False
+                row_messages |= messages
+
+            yield outbound_row, row_success, row_messages
+
+    def apply(
+        self, data: Iterable[Mapping[str, str]], file_name: Optional[str]
+    ) -> Tuple[List[Mapping[str, Any]], Set[Message]]:
+        """Apply the schema to inbound data."""
+        rows, all_messages = [], set()
+        for row, success, messages in self._apply(data, file_name):
+            if success:
+                rows.append(row)
+            all_messages |= messages
+
+        return rows, all_messages
+
     # TODO: implement logic to render spec to markdown based on field documentation.
-    # TODO: implement logic to apply fields to inbound data.
     # TODO: implement Parquet output.

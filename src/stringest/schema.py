@@ -466,3 +466,5 @@ class Schema:
                 message_writer.writerows(message_csv_rows)
 
     # TODO: implement logic to render spec to markdown based on field documentation.
+    # TODO: move fields to their own module.
+    # TODO: implement serialisation and deserialisation for Schema.

@@ -1,14 +1,28 @@
 """Representations of inbound schemas."""
+import contextlib
+import csv
+import io
+import itertools
+import os
 from copy import deepcopy
-from functools import partial
-from multiprocessing import Pool
-from typing import Any, Iterable, List, Literal, Mapping, Optional, Set, Tuple, Union
+from functools import partial, cached_property
+from multiprocessing import Pool, cpu_count
+from pathlib import Path
+from typing import BinaryIO, Dict, Iterable, List, Literal, Optional, Set, Tuple, Union
 
 import pyarrow as pa
+# TODO: Add stub for pyarrow.parquet
+from pyarrow.parquet import ParquetWriter  # type: ignore
 
 from stringest.message import Message
 from stringest.steps.base import AbstractStep
-from stringest.type_aliases import Value, MapFunc, Row, RowIndex, Success
+from stringest.type_aliases import Reader, Value, MapFunc, Record, RecordIndex, Success
+
+
+def read_csv(byte_stream: BinaryIO, encoding: str = "utf-8") -> Iterable[Record]:
+    """A function which reads a CSV from a byte stream."""
+    with io.TextIOWrapper(byte_stream, encoding) as stream:
+        yield from csv.DictReader(stream)
 
 
 class Constant:  # pylint: disable=too-few-public-methods
@@ -21,11 +35,11 @@ class Constant:  # pylint: disable=too-few-public-methods
 
     """
 
-    def __init__(self, value: Any):
+    def __init__(self, value: Value):
         self._value = value
 
     @property
-    def value(self) -> Any:
+    def value(self) -> Value:
         """The value of the constant."""
         return deepcopy(self._value)
 
@@ -275,7 +289,7 @@ class Schema:
         """A copy of the fields in the schema."""
         return self._fields.copy()
 
-    @property
+    @cached_property
     def arrow_schema(self) -> pa.Schema:
         """The schema of the resulting Parquet file as an Apache arrow schema."""
         arrow_fields: List[pa.Field] = []
@@ -287,21 +301,21 @@ class Schema:
 
         return pa.schema(arrow_fields)
 
-    def _apply_row(
-        self, indexed_row: Tuple[RowIndex, Row], file_name: str
-    ) -> Tuple[Row, Success, Set[Message]]:
-        """Apply the schema to an individual row."""
-        row_index, row = indexed_row
+    def _apply_to_record(
+        self, indexed_record: Tuple[RecordIndex, Record], file_name: str
+    ) -> Tuple[RecordIndex, Record, Success, Set[Message]]:
+        """Apply the schema to an individual record."""
+        record_index, record = indexed_record
 
-        outbound_row = {}
-        row_success = True
-        row_messages = set()
+        outbound_record = {}
+        record_success = True
+        record_messages = set()
 
         for field in self._fields:
             field_source = field.name
 
             if isinstance(field_source, str):
-                inbound_value = row.get(field_source)
+                inbound_value = record.get(field_source)
             elif isinstance(field_source, Constant):
                 inbound_value = field_source.value
             elif isinstance(field_source, Special):
@@ -310,9 +324,9 @@ class Schema:
                 if value_type == "file_name":
                     inbound_value = file_name
                 elif value_type == "record_index":
-                    inbound_value = row_index
+                    inbound_value = record_index
                 elif value_type == "record_number":
-                    inbound_value = row_index + 1
+                    inbound_value = record_index + 1
                 else:
                     raise ValueError(
                         f"Unexpected `Special` value type {value_type!r}, "
@@ -326,41 +340,129 @@ class Schema:
                 )
 
             value, success, messages = field.ingest(inbound_value)
-            outbound_row[field.outbound_name] = value
+            outbound_record[field.outbound_name] = value
             if not success:
-                row_success = False
-            row_messages |= messages
+                record_success = False
+            record_messages |= messages
 
-        return outbound_row, row_success, row_messages
+        return record_index, outbound_record, record_success, record_messages
 
-    def apply(
+    def process_chunk(  # pylint: disable=too-many-locals
         self,
-        data: Iterable[Mapping[str, str]],
+        indexed_records: Iterable[Tuple[RecordIndex, Record]],
         file_name: Optional[str] = None,
         n_processes: int = 1,
-    ) -> Tuple[pa.Table, Set[Message]]:
-        """Apply the schema to inbound data."""
-        rows, all_messages = [], set()
-        indexed_rows = enumerate(data)
-        apply_func = partial(self._apply_row, file_name=file_name)
+        mp_chunk_size: int = 50,
+    ) -> Tuple[pa.Table, Dict[RecordIndex, Set[Message]]]:
+        """
+        Apply the schema to a chunk of inbound data (as an iterable of tuples
+        containing a record index and record). This will return a PyArrow
+        table and a dict mapping row index to a set of messages for the row.
+
+        Arguments:
+         - `indexed_records`: an iterable of tuples containing record index
+           and record.
+         - `file_name`: an optional file name.
+         - `n_processes`: the number of processes to use to process the chunks.
+           Defaults to 1. If 0, half the number of cores (to allow for
+           hyperthreading) minus 1 (to allow for the main process).
+         - `mp_chunk_size`: the number of records to pipe to each process at a
+           time. This value can be tuned for performance improvements.
+
+        """
+        records = []
+        all_messages: Dict[RecordIndex, Set[Message]] = {}
+        apply_func = partial(self._apply_to_record, file_name=file_name)
 
         if n_processes == 1:
             process_pool = None
             map_func: MapFunc = map
         else:
+            if n_processes < 0:
+                raise ValueError("`n_processes` must be `0` or a positive int")
+
+            if n_processes == 0:
+                # Really unlikely that this is an odd number, but stranger things
+                # have happened.
+                half_cpu_count, remainder = divmod(cpu_count(), 2)
+                n_processes = half_cpu_count - (1 if not remainder else 0)
+
             process_pool = Pool(n_processes)  # pylint: disable=consider-using-with
-            map_func = process_pool.map
+            map_func = partial(process_pool.imap, chunksize=mp_chunk_size)
 
         try:
-            for row, success, messages in map_func(apply_func, indexed_rows):
+            for index, record, success, messages in map_func(
+                apply_func, indexed_records
+            ):
                 if success:
-                    rows.append(row)
-                all_messages |= messages
+                    records.append(record)
+                all_messages[index] = messages
         finally:
             if process_pool is not None:
                 process_pool.close()
 
-        return pa.Table.from_pylist(rows, schema=self.arrow_schema), all_messages
+        return pa.Table.from_pylist(records, schema=self.arrow_schema), all_messages
 
-    # TODO: actually handle file -> file
+    def process_file(  # pylint: disable=too-many-arguments,too-many-locals
+        self,
+        input_file_path: os.PathLike,
+        parquet_file_path: os.PathLike,
+        message_file_path: os.PathLike,
+        reader: Reader = read_csv,
+        chunk_size: int = 10_000,
+        n_processes: int = 1,
+        mp_chunk_size: int = 50,
+    ):
+        """
+        Apply the schema to an inbound file, producing a Parquet file containing
+        the ingested data and a CSV file containing messages generated as part
+        of the ingestion.
+
+        Arguments:
+         - `file_path`: an inbound file path.
+         - `parquet_file_path`: the path to the outbound parquet file.
+         - `message_file_path`: the path to the outbound messages CSV file.
+         - `reader`: a function used to read the inbound file. This defaults to
+           an implementation based on csv.DictReader.
+         - `chunk_size`: the number of records to read from the file at once.
+           This helps to keep memory usage low.
+         - `n_proceses`: the number of processes to use to process the chunks.
+           Defaults to 1. If 0, half the number of cores (to allow for
+           hyperthreading) minus 1 (to allow for the main process).
+         - `mp_chunk_size`: the number of records to pipe to each process at a
+           time. This value can be tuned for performance improvements.
+
+        """
+        file_name = Path(input_file_path).name
+
+        with contextlib.ExitStack() as stack:
+            file = stack.enter_context(open(input_file_path, mode="rb"))
+            message_writer = csv.writer(
+                stack.enter_context(open(message_file_path, mode="w", encoding="utf-8"))
+            )
+            message_writer.writerow(["Record_Index", "Status", "Message"])
+            parquet_writer = ParquetWriter(
+                str(parquet_file_path), schema=self.arrow_schema
+            )
+            indexed_records = enumerate(reader(file))
+
+            while True:
+                chunk = list(itertools.islice(indexed_records, chunk_size))
+                if not chunk:
+                    parquet_writer.close()
+                    break
+
+                table, all_messages = self.process_chunk(
+                    chunk, file_name, n_processes, mp_chunk_size
+                )
+                parquet_writer.write_table(table)
+
+                message_csv_rows = []
+                for record_index, messages in all_messages.items():
+                    for message in messages:
+                        message_csv_rows.append(
+                            [record_index, message.status, message.content]
+                        )
+                message_writer.writerows(message_csv_rows)
+
     # TODO: implement logic to render spec to markdown based on field documentation.

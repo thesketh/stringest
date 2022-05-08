@@ -67,7 +67,7 @@ class AbstractStep(AbstractStepBase):
     def apply(self, value: Value) -> Tuple[Value, Success, Optional[Message]]:
         """
         Apply the step to a value. Where the step is the first in a sequence,
-        the initial value will always be an optional string.
+        the initial value is usually an optional string.
 
         This should return a tuple containing:
          - The new value. This can be the original value, a transformed/parsed

@@ -1,12 +1,14 @@
 """Representations of inbound schemas."""
 from copy import deepcopy
+from functools import partial
+from multiprocessing import Pool
 from typing import Any, Iterable, List, Literal, Mapping, Optional, Set, Tuple, Union
 
-# import pyarrow as pa  # type: ignore
+import pyarrow as pa
 
 from stringest.message import Message
 from stringest.steps.base import AbstractStep
-from stringest.type_aliases import Value, Success
+from stringest.type_aliases import Value, MapFunc, Row, RowIndex, Success
 
 
 class Constant:  # pylint: disable=too-few-public-methods
@@ -73,20 +75,21 @@ class Field:
 
     Arguments:
      - `name`: the inbound name of the field, a `Constant`, or a `Special`.
-     - `steps`: an (optional) `AbstractStep` or list of `AbstractStep`s to apply to
-       the field, in sequence. For free-text fields, this may be omitted.
-       The first step must accept an optional string, each in sequence must accept
+     - `steps`: an (optional) `AbstractStep` or list of `AbstractStep`s to
+       apply to the field, in sequence. For free-text fields, this may be
+       omitted. Each step may be passed an optional value, and should accept
        the return value of the previous step.
-     - `parquet_type`: a string indicating the type of the field in the Parquet file.
-     - `outbound_name`: the name of the field at output time. If `name` is not a string,
-        this must be provided. If not provided and `name` is a string, `name` will be used.
-     - `mandatory`: A flag indicating whether a value must be provided for the field
-        on input (default: `False`)
+     - `parquet_type`: a PyArrow type. This defaults to a string.
+     - `outbound_name`: the name of the field at output time. If `name` is not
+       a string, this must be provided. If not provided and `name` is a string,
+       `name` will be used.
+     - `mandatory`: A flag indicating whether a value must be provided for the
+       field on input (default: `False`)
      - `nullable`: A flag indicating whether the value is allowed to be null on
        output (default: `True`)
-     - `fail_on_error`: A flag indicating whether an error in the process should
-       result on an ingestion failure. If `False`, the field will be nulled instead.
-       (default: `True`)
+     - `fail_on_error`: A flag indicating whether an error in the process
+       should result on an ingestion failure. If `False`, the field will be
+       nulled instead. (Default: `False`)
 
     """
 
@@ -94,7 +97,7 @@ class Field:
         self,
         name: Union[str, Constant, Special],
         steps: Union[None, AbstractStep, List[AbstractStep]] = None,
-        parquet_type: str = "string",
+        parquet_type: pa.DataType = pa.string(),
         outbound_name: Optional[str] = None,
         mandatory: bool = False,
         nullable: bool = True,
@@ -105,6 +108,11 @@ class Field:
                 f"`name` must be `str`, `Constant` or `Special`, got {type(name)}"
             )
         self._name = name
+
+        if not isinstance(parquet_type, pa.DataType):
+            raise TypeError(
+                f"`parquet_type` must be PyArrow DataType, got {type(parquet_type)}"
+            )
         self._parquet_type = parquet_type
 
         if outbound_name:
@@ -149,7 +157,7 @@ class Field:
         return self._steps.copy()
 
     @property
-    def parquet_type(self) -> str:
+    def parquet_type(self) -> pa.DataType:
         """
         The type of the field in the outbound parquet file.
 
@@ -178,10 +186,10 @@ class Field:
         return self._fail_on_error
 
     def ingest(  # pylint: disable=too-many-branches
-        self, value: Optional[str]
+        self, value: Value
     ) -> Tuple[Value, Success, Set[Message]]:
         """Validate and parse an inbound value."""
-        if value is not None:
+        if isinstance(value, str):
             # Trimming a value's whitespace, replacing with explicit None if the field
             # is empty.
             trimmed = value.strip()
@@ -255,61 +263,104 @@ class Schema:
     def __init__(self, *fields: Field):
         self._fields: List[Field] = list(fields)
 
+        unique_names: Set[str] = set()
+        for field in self._fields:
+            field_name = field.outbound_name
+            if field_name in unique_names:
+                raise ValueError(f"Multiple fields with outbound name {field_name!r}")
+            unique_names.add(field_name)
+
     @property
     def fields(self) -> List[Field]:
         """A copy of the fields in the schema."""
         return self._fields.copy()
 
-    def _apply(
-        self,
-        data: Iterable[Mapping[str, Optional[str]]],
-        file_name: Optional[str] = None,
-    ) -> Iterable[Tuple[Mapping[str, Any], Success, Set[Message]]]:
-        """Apply the schema to inbound data."""
-        for row_index, row in enumerate(data):
-            outbound_row = {}
-            row_success = True
-            row_messages = set()
+    @property
+    def arrow_schema(self) -> pa.Schema:
+        """The schema of the resulting Parquet file as an Apache arrow schema."""
+        arrow_fields: List[pa.Field] = []
+        for field in self._fields:
+            arrow_field = pa.field(
+                field.outbound_name, field.parquet_type, field.nullable
+            )
+            arrow_fields.append(arrow_field)
 
-            for field in self._fields:
-                field_source = field.name
+        return pa.schema(arrow_fields)
 
-                if isinstance(field_source, str):
-                    inbound_value = row.get(field_source)
-                elif isinstance(field_source, Constant):
-                    inbound_value = field_source.value
-                elif isinstance(field_source, Special):
-                    if field_source.value_type == "file_name":
-                        inbound_value = file_name
-                    elif field_source.value_type == "record_index":
-                        inbound_value = str(row_index)
-                    elif field_source.value_type == "record_number":
-                        inbound_value = str(row_index + 1)
+    def _apply_row(
+        self, indexed_row: Tuple[RowIndex, Row], file_name: str
+    ) -> Tuple[Row, Success, Set[Message]]:
+        """Apply the schema to an individual row."""
+        row_index, row = indexed_row
+
+        outbound_row = {}
+        row_success = True
+        row_messages = set()
+
+        for field in self._fields:
+            field_source = field.name
+
+            if isinstance(field_source, str):
+                inbound_value = row.get(field_source)
+            elif isinstance(field_source, Constant):
+                inbound_value = field_source.value
+            elif isinstance(field_source, Special):
+                value_type = field_source.value_type
+
+                if value_type == "file_name":
+                    inbound_value = file_name
+                elif value_type == "record_index":
+                    inbound_value = row_index
+                elif value_type == "record_number":
+                    inbound_value = row_index + 1
                 else:
-                    raise TypeError(
-                        "Inbound value must be `str`, `Constant` or `Special`, got "
-                        + str(type(inbound_value))
+                    raise ValueError(
+                        f"Unexpected `Special` value type {value_type!r}, "
+                        + "Expected one of `{'file_name', 'record_index', "
+                        + "'record_number'}`"
                     )
+            else:
+                raise TypeError(
+                    "Field name must be `str`, `Constant` or `Special`, got "
+                    + str(type(inbound_value))
+                )
 
-                value, success, messages = field.ingest(inbound_value)
-                outbound_row[field.outbound_name] = value
-                if not success:
-                    row_success = False
-                row_messages |= messages
+            value, success, messages = field.ingest(inbound_value)
+            outbound_row[field.outbound_name] = value
+            if not success:
+                row_success = False
+            row_messages |= messages
 
-            yield outbound_row, row_success, row_messages
+        return outbound_row, row_success, row_messages
 
     def apply(
-        self, data: Iterable[Mapping[str, str]], file_name: Optional[str]
-    ) -> Tuple[List[Mapping[str, Any]], Set[Message]]:
+        self,
+        data: Iterable[Mapping[str, str]],
+        file_name: Optional[str] = None,
+        n_processes: int = 1,
+    ) -> Tuple[pa.Table, Set[Message]]:
         """Apply the schema to inbound data."""
         rows, all_messages = [], set()
-        for row, success, messages in self._apply(data, file_name):
-            if success:
-                rows.append(row)
-            all_messages |= messages
+        indexed_rows = enumerate(data)
+        apply_func = partial(self._apply_row, file_name=file_name)
 
-        return rows, all_messages
+        if n_processes == 1:
+            process_pool = None
+            map_func: MapFunc = map
+        else:
+            process_pool = Pool(n_processes)  # pylint: disable=consider-using-with
+            map_func = process_pool.map
 
+        try:
+            for row, success, messages in map_func(apply_func, indexed_rows):
+                if success:
+                    rows.append(row)
+                all_messages |= messages
+        finally:
+            if process_pool is not None:
+                process_pool.close()
+
+        return pa.Table.from_pylist(rows, schema=self.arrow_schema), all_messages
+
+    # TODO: actually handle file -> file
     # TODO: implement logic to render spec to markdown based on field documentation.
-    # TODO: implement Parquet output.
